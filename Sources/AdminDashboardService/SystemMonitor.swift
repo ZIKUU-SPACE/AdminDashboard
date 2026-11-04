@@ -107,14 +107,11 @@ actor SystemMonitor {
     private func readCPUCounters() -> CPUCounters? {
         let path = procRoot.appendingPathComponent("stat")
 
-        guard let contents = try? String(
-            contentsOf: path,
-            encoding: .utf8
-        ),
-        let firstLine = contents.split(
-            separator: "\n",
-            omittingEmptySubsequences: true
-        ).first else {
+        guard let contents = readLinuxTextFile(path),
+              let firstLine = contents.split(
+                separator: "\n",
+                omittingEmptySubsequences: true
+              ).first else {
             return nil
         }
 
@@ -171,10 +168,7 @@ actor SystemMonitor {
     private func memoryMetric() -> Metric {
         let path = procRoot.appendingPathComponent("meminfo")
 
-        guard let contents = try? String(
-            contentsOf: path,
-            encoding: .utf8
-        ) else {
+        guard let contents = readLinuxTextFile(path) else {
             return Metric(value: nil, unit: "%")
         }
 
@@ -296,17 +290,14 @@ actor SystemMonitor {
                 .appendingPathComponent("device")
                 .appendingPathComponent("gpu_busy_percent")
 
-            guard let contents = try? String(
-                contentsOf: path,
-                encoding: .utf8
-            ),
-            let value = Double(
-                contents.trimmingCharacters(
-                    in: .whitespacesAndNewlines
-                )
-            ),
-            value.isFinite,
-            (0.0...100.0).contains(value) else {
+            guard let contents = readLinuxTextFile(path),
+                  let value = Double(
+                    contents.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    )
+                  ),
+                  value.isFinite,
+                  (0.0...100.0).contains(value) else {
                 continue
             }
 
@@ -326,6 +317,77 @@ actor SystemMonitor {
             unit: "%",
             detail: "GPU usage unavailable"
         )
+    }
+
+    // MARK: - Linux File Reading
+
+    /// Reads a small Linux virtual filesystem text file.
+    ///
+    /// /proc and /sys files may report a size of zero even
+    /// when they contain readable data.
+    ///
+    /// Read until EOF instead of relying on file metadata.
+    ///
+    /// EINTR is retried. Other errors return nil.
+    /// An upper bound prevents unbounded memory allocation.
+    ///
+    /// This method performs blocking I/O and must not run
+    /// on the GUI thread.
+    private func readLinuxTextFile(
+        _ url: URL,
+        maximumBytes: Int = 1024 * 1024
+    ) -> String? {
+        guard maximumBytes > 0 else {
+            return nil
+        }
+
+        let descriptor = url.path.withCString { path in
+            Glibc.open(path, O_RDONLY | O_CLOEXEC)
+        }
+
+        guard descriptor >= 0 else {
+            return nil
+        }
+
+        defer {
+            _ = Glibc.close(descriptor)
+        }
+
+        var bytes: [UInt8] = []
+        var chunk = [UInt8](repeating: 0, count: 4096)
+
+        while true {
+            let readCount = chunk.withUnsafeMutableBytes {
+                buffer in
+                Glibc.read(
+                    descriptor,
+                    buffer.baseAddress,
+                    buffer.count
+                )
+            }
+
+            if readCount == 0 {
+                break
+            }
+
+            if readCount < 0 {
+                if errno == EINTR {
+                    continue
+                }
+
+                return nil
+            }
+
+            guard readCount <= maximumBytes - bytes.count else {
+                return nil
+            }
+
+            bytes.append(
+                contentsOf: chunk.prefix(readCount)
+            )
+        }
+
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     // MARK: - Utilities
