@@ -1,0 +1,16 @@
+
+# ~/workspace/AdminDashboard/.gitignore
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Editor
+.vscode/
+
+# OS
+.DS_Store
+
+# Temporary files
+*.swp
+*~
