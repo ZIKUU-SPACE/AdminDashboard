@@ -1,5 +1,4 @@
-
- // ~/workspace/AdminDashboard/Sources/AdminDashboard/OverviewView.swift
+// ~/workspace/AdminDashboard/Sources/AdminDashboard/OverviewView.swift
 
 import Foundation
 import Core
@@ -11,6 +10,10 @@ import AdminDashboardShared
 /// Metrics retrieval and polling belong to DashboardController.
 /// All view operations run on the application's UI thread.
 final class OverviewView: View {
+
+    // MARK: - Container
+
+    private let metricsBox = Box()
 
     // MARK: - Gauges
 
@@ -35,6 +38,23 @@ final class OverviewView: View {
 
     private let statusField = TextField()
 
+    // MARK: - Layout Constants
+
+    private let margin: Float = 20
+    private let boxInsets: Float = 16
+    private let boxTitleHeight: Float = 24
+
+    private let maximumGaugeSize: Float = 160
+
+    private let columnSpacing: Float = 12
+    private let rowSpacing: Float = 12
+
+    private let labelHeight: Float = 26
+    private let labelSpacing: Float = 8
+
+    private let statusHeight: Float = 26
+    private let statusSpacing: Float = 12
+
     // MARK: - Initialization
 
     override init(frame: Rect) {
@@ -50,6 +70,25 @@ final class OverviewView: View {
     // MARK: - Configuration
 
     private func configure() {
+        configureBox()
+        configureFields()
+        configureGauges()
+
+        addSubview(metricsBox)
+        addSubview(statusField)
+
+        layoutContent()
+    }
+
+    private func configureBox() {
+        metricsBox.title = "System Metrics"
+        metricsBox.borderStyle = .line
+        metricsBox.titlePosition = .atTop
+        metricsBox.contentInsets = boxInsets
+        metricsBox.titleHeight = boxTitleHeight
+    }
+
+    private func configureFields() {
         for field in valueFields {
             configureField(field)
             field.alignment = .center
@@ -58,17 +97,15 @@ final class OverviewView: View {
         for field in labelFields {
             configureField(field)
             field.alignment = .center
-        }
 
-        configureField(statusField)
-
-        for field in labelFields {
             field.font = Font(
                 family: "sans-serif",
                 size: 14,
                 weight: .medium
             )
         }
+
+        configureField(statusField)
 
         statusField.font = Font(
             family: "sans-serif",
@@ -86,40 +123,46 @@ final class OverviewView: View {
         gpuLabel.stringValue = "GPU"
 
         statusField.stringValue = "Waiting for metrics..."
+    }
 
+    private func configureGauges() {
         cpuGauge.progressColor = GraphicsColor(
-            red: 0.25, green: 0.49, blue: 0.81
+            red: 0.25,
+            green: 0.49,
+            blue: 0.81
         )
 
         memoryGauge.progressColor = GraphicsColor(
-            red: 0.26, green: 0.62, blue: 0.49
+            red: 0.26,
+            green: 0.62,
+            blue: 0.49
         )
 
         diskGauge.progressColor = GraphicsColor(
-            red: 0.77, green: 0.55, blue: 0.26
+            red: 0.77,
+            green: 0.55,
+            blue: 0.26
         )
 
         gpuGauge.progressColor = GraphicsColor(
-            red: 0.59, green: 0.42, blue: 0.72
+            red: 0.59,
+            green: 0.42,
+            blue: 0.72
         )
 
+        // Gauges are drawn first.
         for gauge in gauges {
-            addSubview(gauge)
+            metricsBox.contentView.addSubview(gauge)
         }
 
-        // Values are added after the gauges so that they
-        // are drawn in front of the circular paths.
+        // Values are drawn over the circular gauges.
         for field in valueFields {
-            addSubview(field)
+            metricsBox.contentView.addSubview(field)
         }
 
         for field in labelFields {
-            addSubview(field)
+            metricsBox.contentView.addSubview(field)
         }
-
-        addSubview(statusField)
-
-        layoutContent()
     }
 
     private func configureField(_ field: TextField) {
@@ -171,11 +214,17 @@ final class OverviewView: View {
         let width = max(0, bounds.size.width)
         let height = max(0, bounds.size.height)
 
+        let boxWidth = max(
+            0,
+            width - margin * 2
+        )
+
+        // Determine the number of gauge columns.
         let columns: Int
 
-        if width >= 760 {
+        if boxWidth >= 760 {
             columns = 4
-        } else if width >= 400 {
+        } else if boxWidth >= 400 {
             columns = 2
         } else {
             columns = 1
@@ -183,31 +232,10 @@ final class OverviewView: View {
 
         let rows = (gauges.count + columns - 1) / columns
 
-        let marginX: Float = 20
-        let marginTop: Float = 20
-        let marginBottom: Float = 14
-
-        let columnSpacing: Float = 12
-        let rowSpacing: Float = 8
-
-        let labelHeight: Float = 26
-        let labelSpacing: Float = 8
-
-        let statusHeight: Float = 26
-        let statusSpacing: Float = 12
-
+        // Available space inside Box.contentView.
         let contentWidth = max(
             0,
-            width - marginX * 2
-        )
-
-        let contentHeight = max(
-            0,
-            height
-                - marginTop
-                - marginBottom
-                - statusHeight
-                - statusSpacing
+            boxWidth - boxInsets * 2
         )
 
         let columnWidth = max(
@@ -218,26 +246,80 @@ final class OverviewView: View {
             ) / Float(columns)
         )
 
-        let rowHeight = max(
+        let gaugeWidthLimit = max(
+            0,
+            columnWidth - 12
+        )
+
+        // The Box is top-aligned, but its content must still
+        // fit when the window becomes shorter.
+        let availableBoxHeight = max(
+            0,
+            height
+                - margin * 2
+                - statusHeight
+                - statusSpacing
+        )
+
+        let availableContentHeight = max(
+            0,
+            availableBoxHeight
+                - boxTitleHeight
+                - boxInsets * 2
+        )
+
+        let availableRowHeight = max(
             0,
             (
-                contentHeight
+                availableContentHeight
                 - Float(rows - 1) * rowSpacing
             ) / Float(rows)
+        )
+
+        let gaugeHeightLimit = max(
+            0,
+            availableRowHeight
+                - labelHeight
+                - labelSpacing
         )
 
         let gaugeSize = max(
             0,
             min(
-                160,
-                columnWidth - 12,
-                rowHeight - labelHeight - labelSpacing
+                maximumGaugeSize,
+                gaugeWidthLimit,
+                gaugeHeightLimit
             )
         )
 
+        let groupHeight = gaugeSize
+            + labelSpacing
+            + labelHeight
+
+        let contentHeight = Float(rows) * groupHeight
+            + Float(rows - 1) * rowSpacing
+
+        let boxHeight = boxTitleHeight
+            + boxInsets * 2
+            + contentHeight
+
+        // MARK: Box Frame
+
+        metricsBox.frame = Rect(
+            x: margin,
+            y: margin,
+            width: boxWidth,
+            height: boxHeight
+        )
+
+        // MARK: Value Font
+
         let valueFont = Font(
             family: "sans-serif",
-            size: max(10, min(28, gaugeSize * 0.20)),
+            size: max(
+                10,
+                min(28, gaugeSize * 0.20)
+            ),
             weight: .semibold
         )
 
@@ -246,11 +328,13 @@ final class OverviewView: View {
                 field.font = valueFont
             }
         }
-        
+
         let valueHeight = min(
             36,
             gaugeSize
         )
+
+        // MARK: Gauge Layout
 
         let gauges = self.gauges
         let values = valueFields
@@ -260,53 +344,45 @@ final class OverviewView: View {
             let column = index % columns
             let row = index / columns
 
-            let cellX = marginX
-                + Float(column)
+            let cellX = Float(column)
                 * (columnWidth + columnSpacing)
 
-            let cellY = marginTop
-                + Float(row)
-                * (rowHeight + rowSpacing)
-
-            let groupHeight = gaugeSize
-                + labelSpacing
-                + labelHeight
-
-            let groupY = cellY
-                + max(0, (rowHeight - groupHeight) / 2)
+            let cellY = Float(row)
+                * (groupHeight + rowSpacing)
 
             let gaugeX = cellX
                 + (columnWidth - gaugeSize) / 2
 
+            let gaugeY = cellY
+
             gauges[index].frame = Rect(
                 x: gaugeX,
-                y: groupY,
+                y: gaugeY,
                 width: gaugeSize,
                 height: gaugeSize
             )
 
             values[index].frame = Rect(
                 x: gaugeX,
-                y: groupY + (gaugeSize - valueHeight) / 2,
+                y: gaugeY + (gaugeSize - valueHeight) / 2,
                 width: gaugeSize,
                 height: valueHeight
             )
 
             labels[index].frame = Rect(
                 x: cellX,
-                y: groupY + gaugeSize + labelSpacing,
+                y: gaugeY + gaugeSize + labelSpacing,
                 width: columnWidth,
                 height: labelHeight
             )
         }
 
+        // MARK: Status
+
         statusField.frame = Rect(
-            x: marginX,
-            y: max(
-                0,
-                height - marginBottom - statusHeight
-            ),
-            width: contentWidth,
+            x: margin,
+            y: margin + boxHeight + statusSpacing,
+            width: boxWidth,
             height: statusHeight
         )
     }
@@ -329,7 +405,8 @@ final class OverviewView: View {
 
     func updateError(_ message: String?) {
         if let message {
-            statusField.stringValue = "Connection error: \(message)"
+            statusField.stringValue =
+                "Connection error: \(message)"
         } else {
             statusField.stringValue = "Connected"
         }
@@ -338,7 +415,8 @@ final class OverviewView: View {
     // MARK: - Formatting
 
     private func format(_ metric: Metric) -> String {
-        guard let value = metric.value, value.isFinite else {
+        guard let value = metric.value,
+              value.isFinite else {
             return "—"
         }
 

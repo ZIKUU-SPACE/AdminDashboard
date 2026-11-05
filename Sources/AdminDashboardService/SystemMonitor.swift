@@ -1,21 +1,31 @@
-
- // ~/workspace/AdminDashboard/Sources/AdminDashboardService/SystemMonitor.swift
+// ~/workspace/AdminDashboard/Sources/AdminDashboardService/SystemMonitor.swift
 
 import Foundation
 import AdminDashboardShared
 import Glibc
 
 actor SystemMonitor {
-    private let procRoot: URL
 
-    private var previousCPU: CPUCounters?
-    private var latestMetrics: SystemMetrics = .empty
-    private var samplingTask: Task<Void, Never>?
+    // MARK: - Configuration
+
+    private let procRoot: URL
+    private let sysRoot: URL
 
     private let samplingInterval: Duration = .seconds(1)
 
-    init(procRoot: URL = URL(fileURLWithPath: "/proc")) {
+    // MARK: - State
+
+    private var previousCPU: CPUCounters?
+    private var latestMetrics: SystemMetrics = .empty
+    private var latestResources: SystemResources?
+    private var samplingTask: Task<Void, Never>?
+
+    init(
+        procRoot: URL = URL(fileURLWithPath: "/proc"),
+        sysRoot: URL = URL(fileURLWithPath: "/sys")
+    ) {
         self.procRoot = procRoot
+        self.sysRoot = sysRoot
     }
 
     // MARK: - Sampling Lifecycle
@@ -31,7 +41,7 @@ actor SystemMonitor {
             }
 
             while !Task.isCancelled {
-                await self.collectMetrics()
+                await self.collect()
 
                 do {
                     try await Task.sleep(
@@ -47,21 +57,72 @@ actor SystemMonitor {
     func stopSampling() {
         samplingTask?.cancel()
         samplingTask = nil
+
         previousCPU = nil
+        latestResources = nil
     }
 
-    // MARK: - Cached Metrics
+    // MARK: - Cached Data
 
     func metrics() -> SystemMetrics {
         latestMetrics
     }
 
-    private func collectMetrics() {
+    /// Returns nil until a complete resource snapshot is available.
+    ///
+    /// GPU usage and optional hardware properties may still be nil
+    /// within a valid snapshot.
+    func resources() -> SystemResources? {
+        latestResources
+    }
+
+    // MARK: - Sampling
+
+    private func collect() {
+        cachedMemoryValues = memoryValues()
+
+        let cpu = cpuMetric()
+        let memory = memorySnapshot()
+        let swap = swapSnapshot()
+        let disk = diskSnapshot()
+        let gpu = gpuSnapshot()
+
         latestMetrics = SystemMetrics(
-            cpu: cpuMetric(),
-            memory: memoryMetric(),
-            disk: diskMetric(),
-            gpu: gpuMetric()
+            cpu: cpu,
+            memory: memory?.metric
+                ?? Metric(value: nil, unit: "%"),
+            disk: disk?.metric
+                ?? Metric(value: nil, unit: "%"),
+            gpu: Metric(
+                value: gpu.usagePercent,
+                unit: "%",
+                detail: gpu.device ?? "GPU usage unavailable"
+            )
+        )
+
+        guard let cpuUsage = cpu.value,
+              let memory,
+              let swap,
+              let disk else {
+            latestResources = nil
+            return
+        }
+
+        let (load1, load5, load15) = loadAverage()
+
+        latestResources = SystemResources(
+            cpu: CPUResourceDetails(
+                usagePercent: cpuUsage,
+                physicalCores: physicalCoreCount(),
+                logicalCores: logicalCoreCount(),
+                loadAverage1m: load1,
+                loadAverage5m: load5,
+                loadAverage15m: load15
+            ),
+            memory: memory.details,
+            swap: swap,
+            disk: disk.details,
+            gpu: gpu
         )
     }
 
@@ -91,7 +152,8 @@ actor SystemMonitor {
         let totalDelta = current.total - previous.total
         let idleDelta = current.idle - previous.idle
 
-        guard totalDelta > 0, idleDelta <= totalDelta else {
+        guard totalDelta > 0,
+              idleDelta <= totalDelta else {
             return Metric(value: nil, unit: "%")
         }
 
@@ -107,7 +169,7 @@ actor SystemMonitor {
     private func readCPUCounters() -> CPUCounters? {
         let path = procRoot.appendingPathComponent("stat")
 
-        guard let contents = readLinuxTextFile(path),
+        guard let contents = LinuxFileReader.read(path),
               let firstLine = contents.split(
                 separator: "\n",
                 omittingEmptySubsequences: true
@@ -163,57 +225,194 @@ actor SystemMonitor {
         )
     }
 
-    // MARK: - Memory
+    private func logicalCoreCount() -> Int? {
+        let count = sysconf(Int32(_SC_NPROCESSORS_ONLN))
+        return count > 0 ? Int(count) : nil
+    }
 
-    private func memoryMetric() -> Metric {
+    private func physicalCoreCount() -> Int? {
+        let path = procRoot.appendingPathComponent("cpuinfo")
+
+        guard let contents = LinuxFileReader.read(path) else {
+            return nil
+        }
+
+        var cores = Set<String>()
+
+        for block in contents.components(
+            separatedBy: "\n\n"
+        ) {
+            var physicalID: String?
+            var coreID: String?
+
+            for line in block.split(separator: "\n") {
+                guard let separator = line.firstIndex(
+                    of: ":"
+                ) else {
+                    continue
+                }
+
+                let key = line[..<separator]
+                    .trimmingCharacters(in: .whitespaces)
+
+                let value = line[
+                    line.index(after: separator)...
+                ].trimmingCharacters(in: .whitespaces)
+
+                switch key {
+                case "physical id":
+                    physicalID = value
+                case "core id":
+                    coreID = value
+                default:
+                    break
+                }
+            }
+
+            if let physicalID, let coreID {
+                cores.insert("\(physicalID):\(coreID)")
+            }
+        }
+
+        return cores.isEmpty ? nil : cores.count
+    }
+
+    private func loadAverage() -> (
+        Double?,
+        Double?,
+        Double?
+    ) {
+        let path = procRoot.appendingPathComponent("loadavg")
+
+        guard let text = LinuxFileReader.read(path) else {
+            return (nil, nil, nil)
+        }
+
+        let fields = text.split(
+            whereSeparator: \.isWhitespace
+        )
+
+        guard fields.count >= 3 else {
+            return (nil, nil, nil)
+        }
+
+        return (
+            Double(fields[0]),
+            Double(fields[1]),
+            Double(fields[2])
+        )
+    }
+
+    // MARK: - Memory and Swap
+
+    private struct MemorySnapshot {
+        let details: MemoryResourceDetails
+        let metric: Metric
+    }
+
+    private func memoryValues() -> [String: UInt64]? {
         let path = procRoot.appendingPathComponent("meminfo")
 
-        guard let contents = readLinuxTextFile(path) else {
-            return Metric(value: nil, unit: "%")
+        guard let contents = LinuxFileReader.read(path) else {
+            return nil
         }
 
         var values: [String: UInt64] = [:]
 
         for line in contents.split(separator: "\n") {
-            let parts = line.split(
+            let fields = line.split(
                 whereSeparator: \.isWhitespace
             )
 
-            guard parts.count >= 2,
-                  let number = UInt64(parts[1]) else {
+            guard fields.count >= 2,
+                  fields[0].hasSuffix(":"),
+                  let number = UInt64(fields[1]) else {
                 continue
             }
 
-            values[String(parts[0].dropLast())] = number
+            let key = String(fields[0].dropLast())
+            values[key] = number
         }
 
-        guard let total = values["MemTotal"],
+        return values
+    }
+
+    private func memorySnapshot() -> MemorySnapshot? {
+        guard let values = cachedMemoryValues,
+              let total = values["MemTotal"],
               let available = values["MemAvailable"],
               total > 0,
               available <= total else {
-            return Metric(value: nil, unit: "%")
+            return nil
         }
 
         let used = total - available
-        let usage = 100.0 * Double(used) / Double(total)
 
-        let usedGiB = Double(used) / (1024.0 * 1024.0)
-        let totalGiB = Double(total) / (1024.0 * 1024.0)
+        let usage = rounded(
+            100.0 * Double(used) / Double(total)
+        )
 
-        return Metric(
-            value: rounded(usage),
-            unit: "%",
-            detail: String(
-                format: "%.1f / %.1f GiB",
-                usedGiB,
-                totalGiB
+        let totalGiB = rounded(kibToGiB(total))
+        let usedGiB = rounded(kibToGiB(used))
+        let availableGiB = rounded(kibToGiB(available))
+
+        let cachedGiB = values["Cached"].map {
+            rounded(kibToGiB($0))
+        }
+
+        return MemorySnapshot(
+            details: MemoryResourceDetails(
+                totalGiB: totalGiB,
+                usedGiB: usedGiB,
+                availableGiB: availableGiB,
+                cachedGiB: cachedGiB,
+                usagePercent: usage
+            ),
+            metric: Metric(
+                value: usage,
+                unit: "%",
+                detail: String(
+                    format: "%.1f / %.1f GiB",
+                    usedGiB,
+                    totalGiB
+                )
             )
         )
     }
 
+    private func swapSnapshot() -> SwapResourceDetails? {
+        guard let values = cachedMemoryValues,
+              let total = values["SwapTotal"],
+              let free = values["SwapFree"],
+              free <= total else {
+            return nil
+        }
+
+        let used = total - free
+
+        let usage = total > 0
+            ? rounded(100.0 * Double(used) / Double(total))
+            : 0.0
+
+        return SwapResourceDetails(
+            totalGiB: rounded(kibToGiB(total)),
+            usedGiB: rounded(kibToGiB(used)),
+            freeGiB: rounded(kibToGiB(free)),
+            usagePercent: usage
+        )
+    }
+
+    /// Memory and Swap share one /proc/meminfo read per sample.
+    private var cachedMemoryValues: [String: UInt64]?
+
     // MARK: - Disk
 
-    private func diskMetric() -> Metric {
+    private struct DiskSnapshot {
+        let details: DiskResourceDetails
+        let metric: Metric
+    }
+
+    private func diskSnapshot() -> DiskSnapshot? {
         var filesystem = statvfs()
 
         let result = "/".withCString { path in
@@ -221,7 +420,7 @@ actor SystemMonitor {
         }
 
         guard result == 0 else {
-            return Metric(value: nil, unit: "%")
+            return nil
         }
 
         let blockSize = Double(filesystem.f_frsize)
@@ -233,53 +432,72 @@ actor SystemMonitor {
               totalBlocks > 0,
               freeBlocks <= totalBlocks,
               availableBlocks <= freeBlocks else {
-            return Metric(value: nil, unit: "%")
+            return nil
         }
 
         let totalBytes = totalBlocks * blockSize
         let usedBytes = (totalBlocks - freeBlocks) * blockSize
         let availableBytes = availableBlocks * blockSize
 
+        // Match psutil's convention for the usage percentage:
+        // reserved blocks are excluded from available capacity.
         let usableBytes = usedBytes + availableBytes
 
         guard usableBytes > 0 else {
-            return Metric(value: nil, unit: "%")
+            return nil
         }
 
-        let usage = 100.0 * usedBytes / usableBytes
+        let usage = rounded(
+            100.0 * usedBytes / usableBytes
+        )
+
         let gib = 1024.0 * 1024.0 * 1024.0
 
-        return Metric(
-            value: rounded(usage),
-            unit: "%",
-            detail: String(
-                format: "%.1f / %.1f GiB",
-                usedBytes / gib,
-                totalBytes / gib
+        let totalGiB = rounded(totalBytes / gib)
+        let usedGiB = rounded(usedBytes / gib)
+        let freeGiB = rounded(availableBytes / gib)
+
+        return DiskSnapshot(
+            details: DiskResourceDetails(
+                totalGiB: totalGiB,
+                usedGiB: usedGiB,
+                freeGiB: freeGiB,
+                usagePercent: usage
+            ),
+            metric: Metric(
+                value: usage,
+                unit: "%",
+                detail: String(
+                    format: "%.1f / %.1f GiB",
+                    usedGiB,
+                    totalGiB
+                )
             )
         )
     }
 
     // MARK: - GPU
 
-    private func gpuMetric() -> Metric {
-        let drmRoot = URL(
-            fileURLWithPath: "/sys/class/drm",
-            isDirectory: true
-        )
+    private func gpuSnapshot() -> GPUResourceDetails {
+        let drmRoot = sysRoot
+            .appendingPathComponent("class")
+            .appendingPathComponent("drm")
 
-        let fileManager = FileManager.default
-
-        guard let entries = try? fileManager.contentsOfDirectory(
-            at: drmRoot,
-            includingPropertiesForKeys: nil
-        ) else {
-            return unavailableGPUMetric()
+        guard let entries = try? FileManager.default
+            .contentsOfDirectory(
+                at: drmRoot,
+                includingPropertiesForKeys: nil
+            ) else {
+            return GPUResourceDetails(
+                device: nil,
+                usagePercent: nil
+            )
         }
 
         let cards = entries
             .filter {
                 $0.lastPathComponent.hasPrefix("card")
+                    && !$0.lastPathComponent.contains("-")
             }
             .sorted {
                 $0.lastPathComponent < $1.lastPathComponent
@@ -290,7 +508,7 @@ actor SystemMonitor {
                 .appendingPathComponent("device")
                 .appendingPathComponent("gpu_busy_percent")
 
-            guard let contents = readLinuxTextFile(path),
+            guard let contents = LinuxFileReader.read(path),
                   let value = Double(
                     contents.trimmingCharacters(
                         in: .whitespacesAndNewlines
@@ -301,96 +519,23 @@ actor SystemMonitor {
                 continue
             }
 
-            return Metric(
-                value: rounded(value),
-                unit: "%",
-                detail: card.lastPathComponent
+            return GPUResourceDetails(
+                device: card.lastPathComponent,
+                usagePercent: rounded(value)
             )
         }
 
-        return unavailableGPUMetric()
-    }
-
-    private func unavailableGPUMetric() -> Metric {
-        Metric(
-            value: nil,
-            unit: "%",
-            detail: "GPU usage unavailable"
+        return GPUResourceDetails(
+            device: nil,
+            usagePercent: nil
         )
     }
 
-    // MARK: - Linux File Reading
-
-    /// Reads a small Linux virtual filesystem text file.
-    ///
-    /// /proc and /sys files may report a size of zero even
-    /// when they contain readable data.
-    ///
-    /// Read until EOF instead of relying on file metadata.
-    ///
-    /// EINTR is retried. Other errors return nil.
-    /// An upper bound prevents unbounded memory allocation.
-    ///
-    /// This method performs blocking I/O and must not run
-    /// on the GUI thread.
-    private func readLinuxTextFile(
-        _ url: URL,
-        maximumBytes: Int = 1024 * 1024
-    ) -> String? {
-        guard maximumBytes > 0 else {
-            return nil
-        }
-
-        let descriptor = url.path.withCString { path in
-            Glibc.open(path, O_RDONLY | O_CLOEXEC)
-        }
-
-        guard descriptor >= 0 else {
-            return nil
-        }
-
-        defer {
-            _ = Glibc.close(descriptor)
-        }
-
-        var bytes: [UInt8] = []
-        var chunk = [UInt8](repeating: 0, count: 4096)
-
-        while true {
-            let readCount = chunk.withUnsafeMutableBytes {
-                buffer in
-                Glibc.read(
-                    descriptor,
-                    buffer.baseAddress,
-                    buffer.count
-                )
-            }
-
-            if readCount == 0 {
-                break
-            }
-
-            if readCount < 0 {
-                if errno == EINTR {
-                    continue
-                }
-
-                return nil
-            }
-
-            guard readCount <= maximumBytes - bytes.count else {
-                return nil
-            }
-
-            bytes.append(
-                contentsOf: chunk.prefix(readCount)
-            )
-        }
-
-        return String(decoding: bytes, as: UTF8.self)
-    }
-
     // MARK: - Utilities
+
+    private func kibToGiB(_ kib: UInt64) -> Double {
+        Double(kib) / (1024.0 * 1024.0)
+    }
 
     private func rounded(_ value: Double) -> Double {
         (value * 10).rounded() / 10
