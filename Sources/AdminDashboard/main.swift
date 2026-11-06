@@ -1,10 +1,11 @@
 
-// ~/workspace/AdminDashboard/Sources/AdminDashboard/main.swift
+ // ~/workspace/AdminDashboard/Sources/AdminDashboard/main.swift
 
 import Foundation
 import ZIKUU
 import Application
 import Core
+import AdminDashboardShared
 
 // MARK: - Application Configuration
 
@@ -30,6 +31,7 @@ let (
     window,
     tabView,
     overviewView,
+    storageView,
     systemView,
     inferenceView
 ) = makeMainWindow()
@@ -102,6 +104,133 @@ systemController.onRuntimeErrorChanged = { [weak systemView] message in
     systemView?.updateRuntimeError(message)
 }
 
+// MARK: - Storage Controller
+
+let storageController = StorageController(
+    application: app
+)
+
+storageController.onServicesChanged = { [weak storageView] services in
+    storageView?.update(services: services)
+}
+
+storageController.onLoadingChanged = { [weak storageView] loading in
+    storageView?.updateLoading(loading)
+}
+
+storageController.onErrorChanged = { [weak storageView] message in
+    storageView?.updateError(message)
+}
+
+// MARK: - Storage Web UI Actions
+
+storageView.onOpenRequested = { service in
+    guard let webPath = service.webPath,
+          webPath.hasPrefix("/"),
+          !webPath.hasPrefix("//") else {
+        return
+    }
+
+    var components = URLComponents()
+
+    components.scheme = "http"
+    components.host = "127.0.0.1"
+    components.port = service.port
+    components.path = webPath
+
+    guard let url = components.url else {
+        return
+    }
+
+    do {
+        let process = Process()
+        process.executableURL = URL(
+            fileURLWithPath: "/usr/bin/xdg-open"
+        )
+        process.arguments = [
+            url.absoluteString
+        ]
+
+        try process.run()
+    } catch {
+        print(
+            "Failed to open Storage Web UI: \(error)"
+        )
+    }
+}
+
+// MARK: - Backup Controller
+
+let backupController = BackupController(
+    application: app
+)
+
+// MARK: - Backup Status
+
+backupController.onStatusChanged = {
+    [weak storageView] status in
+
+    storageView?.updateBackupStatus(status)
+}
+
+backupController.onLoadingChanged = {
+    [weak storageView] loading in
+
+    if loading {
+        storageView?.updateBackupStatus(nil)
+    }
+}
+
+backupController.onExecutingChanged = {
+    [weak storageView] executing in
+
+    storageView?.updateBackupExecuting(executing)
+}
+
+backupController.onCanRunChanged = {
+    [weak storageView] enabled in
+
+    storageView?.updateBackupCanRun(enabled)
+}
+
+// MARK: - Backup Generations
+
+backupController.onCurrentChanged = {
+    [weak storageView] generation in
+
+    storageView?.updateBackupCurrent(generation)
+}
+
+backupController.onPreviousChanged = {
+    [weak storageView] generation in
+
+    storageView?.updateBackupPrevious(generation)
+}
+
+// MARK: - Backup History
+
+backupController.onHistoryChanged = {
+    [weak storageView] history in
+
+    storageView?.updateBackupHistory(history)
+}
+
+// MARK: - Backup Errors
+
+backupController.onErrorChanged = { message in
+    if let message {
+        print("Backup error: \(message)")
+    }
+}
+
+// MARK: - Backup Actions
+
+storageView.onBackupRunRequested = {
+    [weak backupController] in
+
+    backupController?.runBackup()
+}
+
 // MARK: - Inference Controller
 
 let inferenceController = InferenceController(
@@ -160,6 +289,14 @@ tabView.onSelectionChange = { index in
         systemController.deactivate()
     }
 
+    if identifier == "storage" {
+        storageController.activate()
+        backupController.activate()
+    } else {
+        storageController.deactivate()
+        backupController.deactivate()
+    }
+
     if identifier == "inference" {
         inferenceController.activate()
     } else {
@@ -178,6 +315,7 @@ guard window.isVisible else {
 dashboardController.start()
 
 // Account for the selected tab before entering the event loop.
+
 if let selectedIndex = tabView.selectedIndex,
    tabView.items.indices.contains(selectedIndex) {
 
@@ -185,6 +323,11 @@ if let selectedIndex = tabView.selectedIndex,
 
     if identifier == "system" {
         systemController.activate()
+    }
+
+    if identifier == "storage" {
+        storageController.activate()
+        backupController.activate()
     }
 
     if identifier == "inference" {
@@ -195,6 +338,8 @@ if let selectedIndex = tabView.selectedIndex,
 app.run()
 
 inferenceController.deactivate()
+backupController.deactivate()
+storageController.deactivate()
 systemController.deactivate()
 dashboardController.stop()
 
@@ -204,6 +349,7 @@ func makeMainWindow() -> (
     Window,
     TabView,
     OverviewView,
+    StorageView,
     SystemView,
     InferenceView
 ) {
@@ -245,10 +391,14 @@ func makeMainWindow() -> (
 
     // MARK: Storage
 
+    let storageView = StorageView(
+        frame: tabView.pageFrame
+    )
+
     tabView.addTabViewItem(
         TabViewItem(
             label: "Storage",
-            view: View(frame: tabView.pageFrame),
+            view: storageView,
             identifier: "storage"
         )
     )
@@ -287,6 +437,7 @@ func makeMainWindow() -> (
         window,
         tabView,
         overviewView,
+        storageView,
         systemView,
         inferenceView
     )

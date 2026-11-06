@@ -112,6 +112,16 @@ private struct SystemRuntimeResponse: ResponseCodable {
     }
 }
 
+// MARK: - Storage Response Models
+
+private struct StorageStatusHTTPResponse: ResponseCodable {
+    let services: [StorageService]
+
+    init(_ response: StorageStatusResponse) {
+        services = response.services
+    }
+}
+
 // MARK: - Inference Response Models
 
 private struct InferenceBackendsHTTPResponse: ResponseCodable {
@@ -165,6 +175,59 @@ private func inferenceHTTPError(_ error: Error) -> HTTPError {
     )
 }
 
+// MARK: - Backup Response Models
+
+private struct BackupExecutionHTTPResponse: ResponseCodable {
+    let state: String
+    let started_at: String?
+    let completed_at: String?
+    let exit_code: Int?
+    let stdout: String?
+    let stderr: String?
+}
+
+private struct BackupTargetHTTPResponse: Codable, Sendable {
+    let name: String
+    let handler: String
+    let status: String
+    let reason: String?
+}
+
+private struct BackupReportHTTPResponse: Codable, Sendable {
+    let version: Int
+    let started_at: String
+    let completed_at: String
+    let status: String
+    let targets: [BackupTargetHTTPResponse]
+}
+
+private struct BackupGenerationHTTPResponse: ResponseCodable {
+    let generation: String
+    let report: BackupReportHTTPResponse
+}
+
+private struct BackupHistoryEntryHTTPResponse: Codable, Sendable {
+    let run_id: String?
+    let started_at: String
+    let completed_at: String?
+    let execution_state: String
+    let exit_code: Int?
+    let status: String
+    let targets: [BackupTargetHTTPResponse]?
+    let report_started_at: String?
+    let report_completed_at: String?
+    let error: String?
+}
+
+private struct BackupHistoryHTTPResponse: ResponseCodable {
+    let entries: [BackupHistoryEntryHTTPResponse]
+}
+
+private struct BackupStartHTTPResponse: ResponseCodable {
+    let state: String
+    let started_at: String
+}
+
 // MARK: - Application Entry Point
 
 @main
@@ -178,6 +241,8 @@ struct AdminDashboardService {
         await monitor.startSampling()
 
         let inferenceService = InferenceService()
+        let storageMonitor = StorageMonitor()
+        let backupClient = BackupServiceClient()
 
         let router = Router()
 
@@ -245,6 +310,15 @@ struct AdminDashboardService {
             return SystemRuntimeResponse(runtime)
         }
 
+        // MARK: Storage Services
+
+        router.get("/api/storage/status") {
+            _, _ -> StorageStatusHTTPResponse in
+
+            let response = await storageMonitor.status()
+            return StorageStatusHTTPResponse(response)
+        }
+
         // MARK: Inference Backends
 
         router.get("/api/inference/backends") {
@@ -303,6 +377,217 @@ struct AdminDashboardService {
                 return InferenceActionHTTPResponse(response)
             } catch {
                 throw inferenceHTTPError(error)
+            }
+        }
+
+        // MARK: - Backup Execution Status
+
+        router.get("/api/backup/status") {
+            _, _ -> BackupExecutionHTTPResponse in
+
+            let response: BackupServiceResponse
+
+            do {
+                response = try await backupClient.status()
+            } catch {
+                throw HTTPError(
+                    .badGateway,
+                    message: "Mini Backup Service: \(error)"
+                )
+            }
+
+            guard (200..<300).contains(response.statusCode) else {
+                throw HTTPError(
+                    .init(code: response.statusCode),
+                    message: String(
+                        decoding: response.body,
+                        as: UTF8.self
+                    )
+                )
+            }
+
+            do {
+                return try JSONDecoder().decode(
+                    BackupExecutionHTTPResponse.self,
+                    from: response.body
+                )
+            } catch {
+                throw HTTPError(
+                    .badGateway,
+                    message: "Invalid backup status response: \(error)"
+                )
+            }
+        }
+
+        // MARK: - Backup Generations
+
+        router.get("/api/backup/current") {
+            _, _ -> BackupGenerationHTTPResponse in
+
+            let response: BackupServiceResponse
+
+            do {
+                response = try await backupClient.current()
+            } catch {
+                throw HTTPError(
+                    .badGateway,
+                    message: "Mini Backup Service: \(error)"
+                )
+            }
+
+            guard (200..<300).contains(response.statusCode) else {
+                throw HTTPError(
+                    .init(code: response.statusCode),
+                    message: String(
+                        decoding: response.body,
+                        as: UTF8.self
+                    )
+                )
+            }
+
+            do {
+                return try JSONDecoder().decode(
+                    BackupGenerationHTTPResponse.self,
+                    from: response.body
+                )
+            } catch {
+                throw HTTPError(
+                    .badGateway,
+                    message: "Invalid current backup response: \(error)"
+                )
+            }
+        }
+
+        router.get("/api/backup/previous") {
+            _, _ -> BackupGenerationHTTPResponse in
+
+            let response: BackupServiceResponse
+
+            do {
+                response = try await backupClient.previous()
+            } catch {
+                throw HTTPError(
+                    .badGateway,
+                    message: "Mini Backup Service: \(error)"
+                )
+            }
+
+            guard (200..<300).contains(response.statusCode) else {
+                throw HTTPError(
+                    .init(code: response.statusCode),
+                    message: String(
+                        decoding: response.body,
+                        as: UTF8.self
+                    )
+                )
+            }
+
+            do {
+                return try JSONDecoder().decode(
+                    BackupGenerationHTTPResponse.self,
+                    from: response.body
+                )
+            } catch {
+                throw HTTPError(
+                    .badGateway,
+                    message: "Invalid previous backup response: \(error)"
+                )
+            }
+        }
+
+        // MARK: - Backup History
+
+        router.get("/api/backup/history") {
+            request, _ -> BackupHistoryHTTPResponse in
+
+            let limit: Int
+
+            if let rawLimit = request.uri.queryParameters.get("limit") {
+                guard let parsed = Int(rawLimit),
+                    (1...500).contains(parsed) else {
+                    throw HTTPError(
+                        .badRequest,
+                        message: "limit must be between 1 and 500"
+                    )
+                }
+
+                limit = parsed
+            } else {
+                limit = 10
+            }
+
+            let response: BackupServiceResponse
+
+            do {
+                response = try await backupClient.history(
+                    limit: limit
+                )
+            } catch {
+                throw HTTPError(
+                    .badGateway,
+                    message: "Mini Backup Service: \(error)"
+                )
+            }
+
+            guard (200..<300).contains(response.statusCode) else {
+                throw HTTPError(
+                    .init(code: response.statusCode),
+                    message: String(
+                        decoding: response.body,
+                        as: UTF8.self
+                    )
+                )
+            }
+
+            do {
+                return try JSONDecoder().decode(
+                    BackupHistoryHTTPResponse.self,
+                    from: response.body
+                )
+            } catch {
+                throw HTTPError(
+                    .badGateway,
+                    message: "Invalid backup history response: \(error)"
+                )
+            }
+        }
+
+        // MARK: - Backup Execution
+
+        router.post("/api/backup/run") {
+            _, _ -> BackupStartHTTPResponse in
+
+            let response: BackupServiceResponse
+
+            do {
+                response = try await backupClient.run()
+            } catch {
+                throw HTTPError(
+                    .badGateway,
+                    message: "Mini Backup Service: \(error)"
+                )
+            }
+
+            guard (200..<300).contains(response.statusCode) else {
+                throw HTTPError(
+                    .init(code: response.statusCode),
+                    message: String(
+                        decoding: response.body,
+                        as: UTF8.self
+                    )
+                )
+            }
+
+            do {
+                return try JSONDecoder().decode(
+                    BackupStartHTTPResponse.self,
+                    from: response.body
+                )
+            } catch {
+                throw HTTPError(
+                    .badGateway,
+                    message: "Invalid backup start response: \(error)"
+                )
             }
         }
 

@@ -29,6 +29,10 @@ let package = Package(
             url: "https://github.com/hummingbird-project/hummingbird.git",
             exact: "2.15.0"
         ),
+        .package(
+            url: "https://github.com/swift-server/async-http-client.git",
+            exact: "1.37.0"
+        ),
     ],
     targets: [
         .target(
@@ -51,6 +55,10 @@ let package = Package(
                 .product(
                     name: "Hummingbird",
                     package: "hummingbird"
+                ),
+                .product(
+                    name: "AsyncHTTPClient",
+                    package: "async-http-client"
                 ),
             ]
         ),
